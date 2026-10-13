@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+#
+# bin/wofi — drop-in adapter for rofi-style invocations.
+#
+# The scripts in this directory were ported from the adi1090x rofi-themes
+# collection and still call "rofi" with rofi CLI flags. This wrapper
+# translates the most important rofi options to their wofi equivalents,
+# converts the .rasi theme to CSS on the fly (bin/rasi2css.py) and then
+# launches the real wofi in dmenu mode.
+#
+# Translated rofi options:
+#   -theme <file.rasi>   -> converted to wofi CSS (--style), cached in
+#                           $XDG_CACHE_HOME/wofi
+#   -show drun           -> --allow-names (application names mode)
+#   -show run            -> --exec prompt
+#   -p "prompt"          -> --prompt "prompt"
+#   -mesg "message"      -> exported as $WOFI_MSG (wofi has no -mesg)
+#   -l N                 -> --height N*30px approximation
+#   -columns N           -> --width  N*20px approximation
+#   -filter "text"       -> --filter "text"
+#   -dmenu               -> default behaviour of this wrapper
+#   -markup-rows         -> ignored (wofi understands pango markup)
+#   -theme-str '...'     -> ignored (no equivalent in wofi)
+#   -config <file>       -> passed through as --config
+#
+# Anything else is passed through untouched, so native wofi options
+# keep working when calling this wrapper directly.
+
+set -u
+
+# Find the real wofi binary, skipping this wrapper itself.
+REAL_WOFI=""
+for cand in /usr/bin/wofi /usr/local/bin/wofi; do
+    [ -x "$cand" ] && REAL_WOFI="$cand" && break
+done
+if [ -z "$REAL_WOFI" ]; then
+    REAL_WOFI="$(echo "$PATH" | tr ':' '\n' | while read -r d; do
+        [ -x "$d/wofi" ] && [ "$d/wofi" != "$(readlink -f "$0")" ] \
+            && { echo "$d/wofi"; break; }
+    done)"
+fi
+if [ -z "$REAL_WOFI" ]; then
+    echo "wofi-adapter: real 'wofi' binary not found in PATH" >&2
+    exit 1
+fi
+
+RASI2CSS="${0%/*}/rasi2css.py"
+[ -x "$RASI2CSS" ] || RASI2CSS="${HOME}/.config/wofi/bin/rasi2css.py"
+
+theme=""
+prompt=""
+mesg=""
+lines=""
+columns=""
+filter=""
+show=""
+theme_strs=()
+pass_through=()
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -theme)      theme="$2"; shift 2 ;;
+        -theme-str)  theme_strs+=("$2"); shift 2 ;;
+        -p)          prompt="$2"; shift 2 ;;
+        -mesg)       mesg="$2"; shift 2 ;;
+        -l|-lines)   lines="$2"; shift 2 ;;
+        -columns)    columns="$2"; shift 2 ;;
+        -filter)     filter="$2"; shift 2 ;;
+        -show)       show="$2"; shift 2 ;;
+        -modes)      export WOFI_MODES="$2"; shift 2 ;;
+        -config)     pass_through+=(--config "$2"); shift 2 ;;
+        -width)      pass_through+=(--width "$2"); shift 2 ;;
+        -location)   shift 2 ;;
+        -dmenu|-markup-rows|-no-matching|-case-sensitive|\
+        -disable-history|-sort|-no-sort|\
+        -show-icons|-no-show-icons)
+            shift ;;
+        -matching|-normalize-match|-tokenize|-scroll-method|-icon-theme)
+            shift 2 ;;
+        *)
+            pass_through+=("$1"); shift ;;
+    esac
+done
+
+args=(--dmenu)
+
+# ---- Theme: convert .rasi to a wofi-compatible CSS file ----------------
+if [ -n "$theme" ] && [ -f "$theme" ]; then
+    css_dir="${XDG_CACHE_HOME:-$HOME/.cache}/wofi"
+    mkdir -p "$css_dir"
+    if [ "${#theme_strs[@]}" -gt 0 ]; then
+        # -theme-str overrides change the rendered theme, so cache per-args
+        css="$css_dir/$(basename "${theme%.*}").$(printf '%s' "${theme_strs[*]}" | cksum | cut -d' ' -f1).css"
+    else
+        css="$css_dir/$(basename "${theme%.*}").css"
+    fi
+    if [ ! -f "$css" ] || [ "$theme" -nt "$css" ]; then
+        python3 "$RASI2CSS" "$theme" "${theme_strs[@]}" > "$css" || {
+            echo "wofi-adapter: theme conversion failed for $theme" >&2
+        }
+    fi
+    args+=(--style "$css")
+elif [ "${#theme_strs[@]}" -gt 0 ]; then
+    css="$css_dir/theme-str.$(printf '%s' "${theme_strs[*]}" | cksum | cut -d' ' -f1).css"
+    mkdir -p "$css_dir"
+    python3 "$RASI2CSS" /dev/null "${theme_strs[@]}" > "$css" 2>/dev/null \
+        && args+=(--style "$css")
+fi
+
+# ---- Prompt / message ---------------------------------------------------
+[ -n "$prompt" ] && args+=(--prompt "$prompt")
+[ -n "$mesg" ]   && export WOFI_MSG="$mesg"
+
+# ---- Geometry -----------------------------------------------------------
+[ -n "$lines" ]   && args+=(--height "$((lines * 30))")
+[ -n "$columns" ] && args+=(--width "$((columns * 20))")
+[ -n "$filter" ]  && args+=(--filter "$filter")
+
+# ---- Modes --------------------------------------------------------------
+if [ "$show" = "drun" ]; then
+    exec "$REAL_WOFI" "${args[@]}" --allow-names "${pass_through[@]}"
+elif [ "$show" = "run" ]; then
+    exec "$REAL_WOFI" "${args[@]}" --allow-files \
+        --exec "sh -c '{}'" "${pass_through[@]}"
+fi
+
+exec "$REAL_WOFI" "${args[@]}" "${pass_through[@]}"
